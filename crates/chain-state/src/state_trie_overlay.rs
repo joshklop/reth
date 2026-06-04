@@ -289,38 +289,51 @@ impl<N: NodePrimitives> StateTrieOverlayManager<N> {
             None => ComputeOverlayInput::MergeBlocks(blocks),
         };
 
-        // The vacant entry is the cache-fill gate: racing callers block instead of recomputing.
+        // Compute the overlay WITHOUT holding any `overlays` shard lock.
+        //
+        // Holding the vacant-entry (shard) write lock across the blocking worker-pool dispatch
+        // below deadlocks: `WorkerPool::install_fn` blocks the caller until a pool worker runs the
+        // closure, and `insert_block` concurrently submits `get_overlay` work for the same
+        // `(anchor, tip)` key to that same bounded pool. If a pool worker blocks reading/locking
+        // the very shard held here, no worker is ever free to run our closure, so the shard lock
+        // is never released - a cyclic wait that pins the engine thread (it resolves overlays
+        // synchronously during payload validation / `forkchoiceUpdated`) and times out Engine API
+        // calls. Computing first and taking the shard lock only to store the (idempotent) result
+        // removes the lock-across-blocking-dispatch entirely. Racing callers may recompute, which
+        // is wasteful but correct: the overlay is a pure function of `(anchor, tip)`.
+        let computed = {
+            #[cfg(feature = "rayon")]
+            {
+                if let Some(worker_pool) = &self.worker_pool {
+                    let compute_span = span.clone();
+                    let metrics = self.metrics.clone();
+                    Arc::new(worker_pool.install_fn(move || {
+                        let _guard = compute_span.enter();
+                        compute_overlay(compute_input, anchor_hash, &metrics)
+                    }))
+                } else {
+                    Arc::new(compute_overlay(compute_input, anchor_hash, &self.metrics))
+                }
+            }
+
+            #[cfg(not(feature = "rayon"))]
+            {
+                Arc::new(compute_overlay(compute_input, anchor_hash, &self.metrics))
+            }
+        };
+
+        // Store the result, deferring to a value a racing caller may have already inserted so all
+        // callers observe the same shared overlay.
         let input = match self.overlays.entry(key) {
             Entry::Occupied(entry) => {
                 self.metrics.overlay_cache_reuses.increment(1);
                 span.record("cache_reused", true);
-                return Ok(Arc::clone(entry.get()))
+                Arc::clone(entry.get())
             }
             Entry::Vacant(entry) => {
                 self.metrics.overlay_cache_fills.increment(1);
-                let input = {
-                    #[cfg(feature = "rayon")]
-                    {
-                        if let Some(worker_pool) = &self.worker_pool {
-                            let compute_span = span;
-                            let metrics = self.metrics.clone();
-                            Arc::new(worker_pool.install_fn(move || {
-                                let _guard = compute_span.enter();
-                                compute_overlay(compute_input, anchor_hash, &metrics)
-                            }))
-                        } else {
-                            Arc::new(compute_overlay(compute_input, anchor_hash, &self.metrics))
-                        }
-                    }
-
-                    #[cfg(not(feature = "rayon"))]
-                    {
-                        Arc::new(compute_overlay(compute_input, anchor_hash, &self.metrics))
-                    }
-                };
-
-                entry.insert(Arc::clone(&input));
-                input
+                entry.insert(Arc::clone(&computed));
+                computed
             }
         };
 
@@ -652,6 +665,92 @@ mod tests {
 
         let (_, state) = manager.overlay_for_parent(child_hash, anchor_hash).unwrap();
         assert_eq!(state.accounts.len(), 2);
+    }
+
+    /// Regression test for a deadlock between the synchronous overlay cache-fill path and the
+    /// background precompute tasks that `insert_block` submits to the same worker pool.
+    ///
+    /// `get_overlay` used to hold the `overlays` DashMap shard write lock (the vacant entry) for
+    /// the entire duration of the blocking `WorkerPool::install_fn` call. A synchronous caller
+    /// (e.g. the engine thread resolving an in-memory parent overlay during payload validation /
+    /// `forkchoiceUpdated`) could grab that shard lock and then block inside `install_fn` waiting
+    /// for a free pool worker - while every pool worker was itself blocked trying to lock the same
+    /// shard from an `insert_block`-spawned `get_overlay` for the same `(anchor, tip)` key. No
+    /// worker was ever free to run the synchronous caller's closure, so the shard lock was never
+    /// released: a permanent cyclic wait that pins the engine and times out Engine API calls.
+    ///
+    /// The workload runs in a dedicated thread so the test thread can fail fast on a watchdog
+    /// timeout instead of hanging the whole suite when the bug is present.
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn concurrent_fill_and_precompute_do_not_deadlock() {
+        use std::sync::mpsc;
+
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let workload = thread::spawn(move || {
+            // A single-worker pool makes the cyclic wait deterministic: one parked worker is
+            // enough to wedge the whole pool.
+            let pool = Arc::new(WorkerPool::new(1, "ovly-deadlock"));
+            let manager = StateTrieOverlayManager::<EthPrimitives>::new(pool.clone());
+
+            let blocks = TestBlockBuilder::eth()
+                .get_executed_blocks(1..3)
+                .enumerate()
+                .map(|(index, block)| with_unique_state(&block, index as u8 + 1))
+                .collect::<Vec<_>>();
+            let anchor = blocks[0].recovered_block().parent_hash();
+            let block0 = blocks[0].recovered_block().hash();
+            let block1 = blocks[1].recovered_block().hash();
+
+            // Seed the `anchor -> block0` overlay so both the precompute and the synchronous fill
+            // below take the (locking) cache-fill path for the `(anchor, block1)` key.
+            manager.insert_block(blocks[0].clone());
+            manager.overlay_for_parent(block0, anchor).unwrap();
+
+            // Occupy the single worker with a gate we control: nothing else on the pool can run
+            // until the gate is released.
+            let (gate_tx, gate_rx) = mpsc::channel::<()>();
+            pool.spawn(move || {
+                let _ = gate_rx.recv();
+            });
+
+            // Queue the background precompute for `(anchor, block1)` behind the gate. This is the
+            // exact `get_overlay(block1, anchor)` task the engine's background overlay preparation
+            // submits when a new block is inserted.
+            manager.insert_block(blocks[1].clone());
+
+            // A synchronous fill for the SAME key, modeling the engine thread resolving an
+            // in-memory parent overlay during payload validation / `forkchoiceUpdated`. It takes
+            // the `(anchor, block1)` shard lock and then blocks inside `install_fn` waiting for the
+            // (gated) worker.
+            let sync_manager = manager.clone();
+            let sync_fill = thread::spawn(move || {
+                sync_manager.overlay_for_parent(block1, anchor).unwrap();
+            });
+
+            // Give the synchronous fill time to reach the blocked-in-`install_fn` state while it
+            // is still holding the shard lock.
+            thread::sleep(Duration::from_millis(300));
+
+            // Release the gate. The freed worker dequeues the precompute (FIFO: queued before the
+            // sync fill's compute) and - on the buggy code - blocks trying to read/lock the shard
+            // the sync fill still holds, so the sync fill's compute never gets a worker. Cyclic
+            // wait. With the fix the fill computes without holding the shard lock, so both finish.
+            let _ = gate_tx.send(());
+
+            sync_fill.join().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(()) => workload.join().unwrap(),
+            Err(_) => panic!(
+                "StateTrieOverlayManager deadlocked: a synchronous overlay fill never completed. \
+                 The cache-fill holds the `overlays` shard lock across the blocking worker-pool \
+                 dispatch while the pool worker blocks on the same shard."
+            ),
+        }
     }
 
     #[test]
